@@ -56,7 +56,7 @@ function analyzeCrashed(logData) {
 }
 
 function analyzeAppServiced(logData){
-  const logEntries = logData.split('\n');
+  const logEntries = logData.trim().split('\n');
   //var appsserviced_logs = logEntries.filter(line =>line.includes('appsserviced[')&& line.includes("loaded:"));
   var appsserviced_logs = logEntries.filter(line =>line.includes('appsserviced['));
   appsserviced_logs.forEach(pair => {

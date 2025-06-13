@@ -47,6 +47,7 @@ async function analyzeWpeFramework(files) {
     if(ThunderCallLines.length && ThunderResponseLines.length){
       displayMatchedPairs(matchedPairs);
     }
+    analyzeDeviceActivation(wpeFrameworklogEntries);
     analyzeKeyManager(wpeFrameworklogEntries);
     analyzeNetworkConnectivity(wpeFrameworklogEntries);
     analyzeWebprocessUnresponsive(wpeFrameworklogEntries);
@@ -58,6 +59,39 @@ async function analyzeWpeFramework(files) {
     <p>ThunderResponse: ${ThunderResponseLines.length}</p>
     `;
     document.getElementById('WpeFrameworkresult').innerHTML = WpeFrameworkresultHTML;
+}
+
+async function analyzeVersion(files) {
+  const VersionFilteredFiles = Array.from(files).filter(file => {
+    const fileName = file.fileObject.name;
+    if(fileName.startsWith('version')){
+      return fileName;
+    }
+  });
+
+  const VersionlogData = await readFiles(VersionFilteredFiles.map(entry => {return entry.fileObject}));
+  const VersionLogs = VersionlogData.trim().split('\n');
+   const buildDetails = {};
+
+  VersionLogs.forEach(line => {
+    let [key, value] = line.split(/[:=]/);
+    if (value?.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1);
+    }
+    buildDetails[key.trim()] = value?.trim() ?? '';
+  });
+
+  displayTitle('🛠️ Build Details');
+
+  for (const [key, value] of Object.entries(buildDetails)) {
+    displayBuildDetail(key, value);
+  }
+}
+
+function displayBuildDetail(label, value) {
+  const div = document.createElement('div');
+  div.innerHTML = `<strong>${label}:</strong> ${value}`;
+  document.body.appendChild(div);
 }
 
 async function analyzeCoreLogs(files) {
@@ -73,6 +107,9 @@ async function analyzeCoreLogs(files) {
   Crashed_modules.forEach(pair => {
     Display_info(pair);
   });
+  if(Crashed_modules.length==0){
+    displayTitle('No crash observed with this logs');
+  }
 }
 
 async function analyzeSkyMessages(files){
@@ -83,6 +120,7 @@ async function analyzeSkyMessages(files){
     }
   });
   const skyMessageslogData = await readFiles(skyMessagesFilteredFiles.map(entry => {return entry.fileObject}));
+  analyzeJourneySteps(skyMessageslogData);
   analyzeAppServiced(skyMessageslogData);
   analyzeAppServiceProxy(skyMessageslogData);
 }
@@ -96,11 +134,15 @@ async function analyzeTopLogs(files){
   });
   const topLogData = await readFiles(topLogsFilteredFiles.map(entry => {return entry.fileObject}));
   const topLogEntries = topLogData.trim().split('\n');
+  var topenteryCount = 0;
   const commandMap = new Map();
 
   for (const line of topLogEntries) {
     const parts = line.split(/\s+/);
-    if (parts.length >= 17 && parts[16] === 'COMMAND') continue;
+    if (parts.length >= 17 && parts[16] === 'COMMAND'){ 
+      topenteryCount++;
+      continue;
+    }
     const timestampStr = `${parts[0]} ${parts[1]} ${parts[2]} ${parts[3]}`;
 
     if (parts.length == 17) {
@@ -133,25 +175,29 @@ async function analyzeTopLogs(files){
       }
     }
   }
-  displayTitle('CPU USAGE');
-  for (const [command, processMap] of commandMap){
+  if(topenteryCount > 3){
+    displayTitle('CPU USAGE');
+    for (const [command, processMap] of commandMap){
+        processMap.forEach((value, key)=>{
+          if(value.cpuUsage.length > 3){
+            plotUsage(command+key,value.cpuUsage, value.timestamps, '%CPU');
+          }
+      })
+    }
+    
+    displayTitle('MEMORY USAGE');
+    for (const [command, processMap] of commandMap){
       processMap.forEach((value, key)=>{
         if(value.cpuUsage.length > 3){
-          plotUsage(command+key,value.cpuUsage, value.timestamps, '%CPU');
+          plotUsage(command+key,value.memUsage, value.timestamps, '%MEM');
         }
-    })
-  }
-  
-  displayTitle('MEMORY USAGE');
-  for (const [command, processMap] of commandMap){
-    processMap.forEach((value, key)=>{
-      if(value.cpuUsage.length > 3){
-        plotUsage(command+key,value.memUsage, value.timestamps, '%MEM');
-      }
-    })
-  }
-
+      })
+    }
   analyzeUsedAndFreeMem(topLogEntries);
+  }
+  else{
+    displayTitle('Not able to debug top logs it have below 3 entries');
+  }
 }
 
 function analyzeUsedAndFreeMem(topLogEntries){
@@ -168,6 +214,117 @@ function analyzeUsedAndFreeMem(topLogEntries){
   displayTitle('OVERALL MemoryUsage');
   plotUsage('CumulativeMemoryUsage',memeoryUsed,timeStamp,'OverAllMem' );
 }
+
+async function analyzeSystemLogs(files) {
+  const systemFilteredFiles = Array.from(files).filter(file => {
+    const fileName = file.fileObject.name;
+    if(fileName.startsWith('system')){
+      return fileName;
+    }
+  });
+
+  const systemlogData = await readFiles(systemFilteredFiles.map(entry => {return entry.fileObject}));
+  const allLogs = systemlogData.trim().split('\n');;
+
+  const parseLog = (line) => {
+    const match = line.match(/^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+systemd\[1\]:\s+(.*)$/);
+    if (!match) return null;
+    const timestamp = new Date(match[1]);
+    const message = match[2].trim();
+    return { timestamp, message };
+  };
+
+  const entries = allLogs.map(parseLog).filter(Boolean);
+
+  const pendingStarts = new Map();
+  const pendingMounts = new Map();
+  const results = [];
+
+  for (const { timestamp, message } of entries) {
+    let key;
+
+    if (message.startsWith('Starting ')) {
+      key = message.replace(/^Starting\s+/, '').replace(/\.\.\.$/, '');
+      pendingStarts.set(key, timestamp);
+    } else if (message.startsWith('Started ')) {
+      key = message.replace(/^Started\s+/, '').replace(/\.$/, '');
+      if (pendingStarts.has(key)) {
+        const startTime = pendingStarts.get(key);
+        pendingStarts.delete(key);
+        results.push({
+          type: 'service',
+          name: key,
+          startTime,
+          endTime: timestamp,
+          durationMs: timestamp - startTime,
+        });
+      }
+    } else if (message.startsWith('Mounting ')) {
+      key = message.replace(/^Mounting\s+/, '').replace(/\.\.\.$/, '');
+      pendingMounts.set(key, timestamp);
+    } else if (message.startsWith('Mounted ')) {
+      key = message.replace(/^Mounted\s+/, '').replace(/\.$/, '');
+      if (pendingMounts.has(key)) {
+        const mountTime = pendingMounts.get(key);
+        pendingMounts.delete(key);
+        results.push({
+          type: 'mount',
+          name: key,
+          startTime: mountTime,
+          endTime: timestamp,
+          durationMs: timestamp - mountTime,
+        });
+      }
+    }
+  }
+
+  // Add incomplete start entries
+  for (const [name, time] of pendingStarts.entries()) {
+    results.push({
+      type: 'service',
+      name,
+      startTime: time,
+      endTime: null,
+      durationMs: null,
+      status: 'incomplete',
+    });
+  }
+
+  // Add incomplete mount entries (optional)
+  for (const [name, time] of pendingMounts.entries()) {
+    results.push({
+      type: 'mount',
+      name,
+      startTime: time,
+      endTime: null,
+      durationMs: null,
+      status: 'incomplete',
+    });
+  }
+  displaySystemLogResults(results);
+}
+
+function displaySystemLogResults(results) {
+  const completed = results.filter(r => r.endTime);
+  const incomplete = results.filter(r => !r.endTime);
+
+  // Display Completed Entries emoji ✅ get from emojipedia.org
+  displayTitle('✅ Completed Services and Mounts');
+  completed.forEach(entry => {
+    const div = document.createElement('div');
+    div.textContent = `${entry.type.toUpperCase()}: ${entry.name} | Duration: ${entry.durationMs} ms`;
+    document.body.appendChild(div);
+  });
+
+  // Display Incomplete Entries 
+  displayTitle('❌Incomplete Services and Mounts');
+  incomplete.forEach(entry => {
+    const div = document.createElement('div');
+    div.textContent = `${entry.type.toUpperCase()}: ${entry.name} | Started at: ${entry.startTime.toISOString()}`;
+    document.body.appendChild(div);
+  });
+}
+
 
 function plotUsage(canvasId, Usage, timestamps, ylabelString){
   const container = document.createElement('div');
@@ -222,11 +379,11 @@ function plotUsage(canvasId, Usage, timestamps, ylabelString){
 }
 
 function analyzeAppServiced(skyMessageslogData){
-  const skyMessageslogEntries = skyMessageslogData.split('\n');
+  const skyMessageslogEntries = skyMessageslogData.trim().split('\n');
   //var appsserviced_logs = logEntries.filter(line =>line.includes('appsserviced[')&& line.includes("loaded:"));
   var appsserviced_logs = skyMessageslogEntries.filter(line =>line.includes('appsserviced['));
   appsserviced_logs.forEach(pair => {
-    Display_info(pair);
+    //Display_info(pair);
   });
 }
 
@@ -253,6 +410,34 @@ function analyzeAppServiceProxy(skyMessageslogData) {
   if(ProxyRequestRecieved.length && ProxyResponseSent.length){
     displayAppserviceProxyRequestResponseGraph(matchedPairs); 
   }
+}
+
+function analyzeJourneySteps(skyMessageslogData){
+  const skyMessageslogEntries = skyMessageslogData.trim().split('\n');
+  const journeySteps = [];
+
+  const regex = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+.*milestone:\s+ENTERING JOURNEY STEP\s+:\s+"([^"]+)"/;
+
+  for (const line of skyMessageslogEntries) {
+    const match = line.match(regex);
+    if (match) {
+      journeySteps.push({
+        timestamp: new Date(match[1]),
+        step: match[2]
+      });
+    }
+  }
+  if(journeySteps.length){
+    displayTitle('🚀 Journey Steps');
+    journeySteps.forEach(step => {
+      const Data = document.createElement('p');
+      Data.textContent = `🕒 ${step.timestamp.toISOString()} — ${step.step}`;
+      document.body.appendChild(Data);
+      }
+    );
+
+  }
+  return journeySteps;
 }
 
 function analyzeKeyManager(wpeFrameworklogEntries){
@@ -345,12 +530,12 @@ function analyzePluginActivation(wpeFrameworklogEntries){
   !isPluginActivated(plugin, activatedPlugins) );
 
   if (notActivated.length > 0) {
-    Display_info('Plugins that were activating but not activated:');
+    displayTitle('Plugins that were activating but not activated:');
     notActivated.forEach(plugin => {
       Display_info('Plugin Name: ' + plugin.pluginName + ', Org Path: ' + plugin.orgPath);
     });
   } else {
-    Display_info('All activating plugins were successfully activated.');
+    displayTitle('All activating plugins were successfully activated.');
   }
 }
 
@@ -362,11 +547,51 @@ function isPluginActivated(activatingPlugin, activatedPlugins) {
   );
 }
 
+function analyzeDeviceActivation(wpeFrameworklogEntries){
+  const parsedLogs = [];
+
+  const regex = /^(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+\S+\[\d+\]:\s+\[\d+\]\s+([DIWE]-\|)\s+\[([^\]:]+):(\d+)\]\s+([^(]+):\s*(.*)$/;
+
+  for (const line of wpeFrameworklogEntries) {
+    const match = line.match(regex);
+    if (match) {
+      parsedLogs.push({
+        timestamp: new Date(match[1]),
+        level: match[2],
+        file: match[3],
+        line: parseInt(match[4]),
+        function: match[5].trim(),
+        message: match[6].trim()
+      });
+    }
+  }
+  
+  displayTitle('📋 DeviceProvisioning Logs');
+
+  parsedLogs.forEach(entry => DisplayProvisioningInfo(entry));
+
+  return parsedLogs;
+}
+
+function DisplayProvisioningInfo(entry) {
+  const div = document.createElement('div');
+  div.style.padding = '4px 0';
+  div.innerHTML = `
+    <strong>[${entry.level}]</strong> ${entry.timestamp.toISOString()} - 
+    <em>${entry.file}:${entry.line}</em> 
+    <strong>${entry.function}</strong> - 
+    ${entry.message}
+  `;
+  document.body.appendChild(div);
+}
+
 function analyzeLogData(files) {
+    analyzeVersion(files);
     analyzeWpeFramework(files);
     analyzeCoreLogs(files);
     analyzeSkyMessages(files);
     analyzeTopLogs(files);
+    analyzeSystemLogs(files);
 }
 
 function displayAppserviceProxyRequestResponseGraph(matchedPairs){
@@ -502,16 +727,30 @@ function splitDateTime(logEntries){
   return parsedLogs;
 }
 
-function splitDateTimeSingleEntry(logEntry){
-  parts = logEntry.split(' ');
-  const [year, month, day, time, ...logContent] = parts;
-  const [hour, minute, secondAndMicroSeconds] = time.split(':');
-  const [second, MicroSeconds] = secondAndMicroSeconds.split('.');
-  return { year, month, day, hour, minute, second, MicroSeconds, log: logContent.join(' ') };
+function splitDateTimeSingleEntry(logEntry) {
+  const dateTimeEndIndex = logEntry.indexOf('Z') + 1;
+  const dateTime = logEntry.slice(0, dateTimeEndIndex);
+  const restOfLog = logEntry.slice(dateTimeEndIndex).trim();
+
+  const [date, timeWithMs] = dateTime.split('T');
+  const [time, msAndZone] = timeWithMs.split('.');
+  const [hour, minute, second] = time.split(':');
+  const millisecond = msAndZone.replace('Z', '');
+
+  return {
+    year: date.split('-')[0],
+    month: date.split('-')[1],
+    day: date.split('-')[2],
+    hour,
+    minute,
+    second,
+    millisecond,
+    log: restOfLog
+  };
 }
 
 function getDiffFromTimestamp(RequestTimeStamp, ResponseTimeStamp){
-  let ResponseTimeMs = null;
+  let ResponseTimeMs = 0;
   if(parseFloat(RequestTimeStamp.year) == parseFloat(ResponseTimeStamp.year)){
     if(parseMonth(RequestTimeStamp.month) == parseMonth(ResponseTimeStamp.month)){
       if(parseFloat(RequestTimeStamp.day) == parseFloat(ResponseTimeStamp.day)){
@@ -526,7 +765,7 @@ function getDiffFromTimestamp(RequestTimeStamp, ResponseTimeStamp){
 }
 
 function getHourDiffernce(RequestTimeStamp, ResponseTimeStamp){
-  let ResponseTimeMs;
+  let ResponseTimeMs =0;
   let requestHour = parseFloat(RequestTimeStamp.hour);
   let responseHour = parseFloat(ResponseTimeStamp.hour); 
   if( requestHour == responseHour){
@@ -543,7 +782,7 @@ function getHourDiffernce(RequestTimeStamp, ResponseTimeStamp){
 }
 
 function getMinutesDiffernce(RequestTimeStamp, ResponseTimeStamp){
-  let ResponseTimeMs;
+  let ResponseTimeMs = 0;
   let requestMinute = parseFloat(RequestTimeStamp.minute);
   let responseMinute = parseFloat(ResponseTimeStamp.minute); 
   if( requestMinute == responseMinute){
@@ -558,7 +797,7 @@ function getMinutesDiffernce(RequestTimeStamp, ResponseTimeStamp){
 }
 
 function getSecondsDiffernce(RequestTimeStamp, ResponseTimeStamp){
-  let ResponseTimeMs;
+  let ResponseTimeMs =0;
   let requestSeconds = parseFloat(RequestTimeStamp.second);
   let responseSeconds = parseFloat(ResponseTimeStamp.second); 
   if( requestSeconds == responseSeconds){
@@ -573,15 +812,15 @@ function getSecondsDiffernce(RequestTimeStamp, ResponseTimeStamp){
 }
 
 function getMilliSecondsDiffernce(RequestTimeStamp, ResponseTimeStamp){
-  let ResponseTimeMs;
-  let requestMicroseconds = parseFloat(RequestTimeStamp.MicroSeconds);
-  let responseMicroseconds =  parseFloat(ResponseTimeStamp.MicroSeconds);
-  if(requestMicroseconds == responseMicroseconds){
+  let ResponseTimeMs = 0;
+  let requestMiliseconds = parseFloat(RequestTimeStamp.millisecond);
+  let responseMiliseconds =  parseFloat(ResponseTimeStamp.millisecond);
+  if(requestMiliseconds == responseMiliseconds){
     ResponseTimeMs = 0;
-  } else if(responseMicroseconds < requestMicroseconds){
-    ResponseTimeMs = responseMicroseconds + 1000 - requestMicroseconds; 
+  } else if(responseMiliseconds < requestMiliseconds){
+    ResponseTimeMs = responseMiliseconds + 1000 - requestMiliseconds; 
   }else{
-    ResponseTimeMs = responseMicroseconds-requestMicroseconds;
+    ResponseTimeMs = responseMiliseconds-requestMiliseconds;
   }
   ResponseTimeMs = ResponseTimeMs/1000;
   return ResponseTimeMs;
@@ -673,3 +912,4 @@ function displayTitle(textContent){
   title.textContent = textContent;
   document.body.appendChild(title);
 }
+
